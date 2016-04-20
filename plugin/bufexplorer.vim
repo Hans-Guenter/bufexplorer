@@ -495,12 +495,14 @@ function! s:SetupSyntax()
         syn match bufExplorerToggleSplit  "toggle split type" contained
         syn match bufExplorerToggleOpen   "toggle open mode" contained
 
+    " Modify some matches to allow the bufExplorerModBuf match to precede them
+	"    hgs 16.11.2012
         syn match bufExplorerModBuf    /^\s*\d\+.\{4}+.*/
         syn match bufExplorerLockedBuf /^\s*\d\+.\{3}[\-=].*/
-        syn match bufExplorerHidBuf    /^\s*\d\+.\{2}h.*/
-        syn match bufExplorerActBuf    /^\s*\d\+.\{2}a.*/
-        syn match bufExplorerCurBuf    /^\s*\d\+.%.*/
-        syn match bufExplorerAltBuf    /^\s*\d\+.#.*/
+        syn match bufExplorerHidBuf    /^\s*\d\+.\{2}h\s[^+].*/
+        syn match bufExplorerActBuf    /^\s*\d\+.\{2}a\s[^+].*/
+        syn match bufExplorerCurBuf    /^\s*\d\+.%.\{2}[^+].*/
+        syn match bufExplorerAltBuf    /^\s*\d\+.#.\{2}[^+].*/
         syn match bufExplorerUnlBuf    /^\s*\d\+u.*/
         syn match bufExplorerInactBuf  /^\s*\d\+ \{7}.*/
 
