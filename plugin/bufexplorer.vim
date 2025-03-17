@@ -609,7 +609,7 @@ function! BufExplorer()
     " Forget any cached MRU ordering from previous invocations.
     unlet! s:mruOrder
 
-    silent let s:raw_buffer_listing = s:GetBufferInfo(0)
+    let s:raw_buffer_listing = s:GetBufferInfo(0)
 
     call s:MRUGarbageCollectBufs()
     call s:MRUGarbageCollectTabs()
@@ -685,6 +685,12 @@ function! s:DisplayBufferList()
     setlocal nomodifiable
 endfunction
 
+" RedisplayBufferList {{{2
+function! s:RedisplayBufferList()
+    call s:RebuildBufferList()
+    call s:UpdateHelpStatus()
+endfunction
+
 " MapKeys {{{2
 function! s:MapKeys()
     if exists("b:displayMode") && b:displayMode == "winmanager"
@@ -716,7 +722,7 @@ function! s:MapKeys()
     nnoremap <script> <silent> <nowait> <buffer> u             :call <SID>ToggleShowUnlisted()<CR>
     nnoremap <script> <silent> <nowait> <buffer> v             :call <SID>SelectBuffer("split", "vr")<CR>
     nnoremap <script> <silent> <nowait> <buffer> V             :call <SID>SelectBuffer("split", "vl")<CR>
-    nnoremap <script> <silent> <nowait> <buffer> H             :call <SID>ToggleShowTerminal()<CR>
+    nnoremap <script> <silent> <nowait> <buffer> X             :call <SID>ToggleShowTerminal()<CR>
 
 
     for k in ["G", "n", "N", "L", "M", "H"]
@@ -843,6 +849,7 @@ function! s:CreateHelp()
         call add(header, '" u : toggle showing unlisted buffers')
         call add(header, '" V : open buffer in another window on the left of the current')
         call add(header, '" v : open buffer in another window on the right of the current')
+        call add(header, '" X : toggle showing terminal buffers')
     else
         call add(header, '" Press <F1> for Help')
     endif
@@ -859,6 +866,10 @@ endfunction
 
 " CalculateBufferDetails {{{2
 " Calculate `buf`-related details.
+" Only these fields of `buf` must be defined on entry:
+" - `._bufnr`
+" - `.attributes`
+" - `.line`
 function! s:CalculateBufferDetails(buf)
     let buf = a:buf
     let name = bufname(buf._bufnr)
@@ -868,12 +879,78 @@ function! s:CalculateBufferDetails(buf)
     endif
     let buf.isterminal = getbufvar(buf._bufnr, '&buftype') == 'terminal'
     if buf.isterminal
-        let buf.fullname = name
-        let buf.isdir = 0
-    else
-        let buf.fullname = simplify(fnamemodify(name, ':p'))
-        let buf.isdir = getftype(buf.fullname) == "dir"
+        " Neovim uses paths with `term://` prefix, where the provided path
+        " is the current working directory when the terminal was launched, e.g.:
+        " - Unix:
+        "   term://~/tmp/sort//1464953:/bin/bash
+        " - Windows:
+        "   term://C:\apps\nvim-win64\bin//6408:C:\Windows\system32\cmd.exe
+        " Vim uses paths starting with `!`, with no provided path, e.g.:
+        " - Unix:
+        "   !/bin/bash
+        " - Windows:
+        "   !C:\Windows\system32\cmd.exe
+
+        " Use the terminal's current working directory as the `path`.
+        " For `shortname`, use `!PID:shellName`, prefixed with `!` as Vim does,
+        " and without the shell's path for brevity, e.g.:
+        "   `/bin/bash` -> `!bash`
+        "   `1464953:/bin/bash` -> `!1464953:bash`
+        "   `C:\Windows\system32\cmd.exe` -> `!cmd.exe`
+        "   `6408:C:\Windows\system32\cmd.exe` -> `!6408:cmd.exe`
+
+        " Neovim-style name format:
+        "   term://(cwd)//(pid):(shellPath)
+        " e.g.:
+        "   term://~/tmp/sort//1464953:/bin/bash
+        " `cwd` is the directory at terminal launch.
+        let termNameParts = matchlist(name, '\v\c^term://(.*)//(\d+):(.*)$')
+        if len(termNameParts) > 0
+            let [cwd, pidStr, shellPath] = termNameParts[1:3]
+            let pid = str2nr(pidStr)
+            let shellName = fnamemodify(shellPath, ':t')
+        else
+            " Default to Vim's current working directory.
+            let cwd = '.'
+            let shellName = fnamemodify(name, ':t')
+            let pid = -1
+            if exists('*term_getjob') && exists('*job_info')
+                let job = term_getjob(buf._bufnr)
+                if job != v:null
+                    let pid = job_info(job).process
+                endif
+            endif
+        endif
+
+        if pid < 0
+            let shortname = '!' . shellName
+        else
+            let shortname = '!' . pid . ':' . shellName
+            " On some systems having a `/proc` filesystem (e.g., Linux, *BSD,
+            " Solaris), each process has a `cwd` symlink for the current working
+            " directory.  `resolve()` will return the actual current working
+            " directory if possible; otherwise, it will return the symlink path
+            " unchanged.
+            let cwd_symlink = '/proc/' . pid . '/cwd'
+            let resolved_cwd = resolve(cwd_symlink)
+            if resolved_cwd != cwd_symlink
+                let cwd = resolved_cwd
+            endif
+        endif
+
+        let slashed_path = fnamemodify(cwd, ':p')
+        let buf.fullname = slashed_path . shortname
+        let buf.shortname = shortname
+        let homepath = fnamemodify(slashed_path, ':~:h')
+        let buf.path = homepath
+        let buf.homename = fnamemodify(buf.fullname, ':~')
+        let buf.relativepath = fnamemodify(slashed_path, ':~:.:h')
+        let buf.relativename = fnamemodify(buf.fullname, ':~:.')
+        return
     endif
+
+    let buf.fullname = simplify(fnamemodify(name, ':p'))
+    let buf.isdir = getftype(buf.fullname) == "dir"
     if buf.isdir
         " `buf.fullname` ends with a path separator; this will be
         " removed via the first `:h` applied to `buf.fullname` (except
@@ -901,18 +978,41 @@ function! s:CalculateBufferDetails(buf)
 endfunction
 
 " GetBufferInfo {{{2
-function! s:GetBufferInfo(bufnr)
+" Return dictionary `{ bufNbr : buf }`.
+" - If `onlyBufNbr > 0`, dictionary will contain at most that buffer.
+" On return, only these fields are set for each `buf`:
+" - `._bufnr`
+" - `.attributes`
+" - `.line`
+" Other fields will be populated by `s:CalculateBufferDetails()`.
+function! s:GetBufferInfo(onlyBufNbr)
     redir => bufoutput
 
-    " Show all buffers including the unlisted ones. [!] tells Vim to show the
-    " unlisted ones.
-    buffers!
+    " Below, `:silent buffers` allows capturing the output via `:redir` but
+    " prevents display to the user.
+
+    if a:onlyBufNbr > 0 && buflisted(a:onlyBufNbr)
+        " We care only about the listed buffer `a:onlyBufNbr`, so no need to
+        " enumerate unlisted buffers.
+        silent buffers
+    else
+        " Use `!` to show all buffers including the unlisted ones.
+        silent buffers!
+    endif
     redir END
 
-    if a:bufnr > 0
+    if a:onlyBufNbr > 0
         " Since we are only interested in this specified buffer remove the
         " other buffers listed.
-        let bufoutput = substitute(bufoutput."\n", '^.*\n\(\s*'.a:bufnr.'\>.\{-}\)\n.*', '\1', '')
+        " Use a very-magic pattern starting with a newline and a run of zero or
+        " more spaces/tabs:
+        let onlyLinePattern = '\v\n\s*'
+        " Continue with the buffer number followed by a non-digit character
+        " (which will be a buffer attribute character such as `u` or ` `).
+        let onlyLinePattern .= a:onlyBufNbr . '\D'
+        " Finish with a run of zero or more non-newline characters plus newline:
+        let onlyLinePattern .= '[^\n]*\n'
+        let bufoutput = matchstr("\n" . bufoutput . "\n", onlyLinePattern)
     endif
 
     let all = {}
@@ -1154,6 +1254,11 @@ function! s:SelectBuffer(...)
 endfunction
 
 " RemoveBuffer {{{2
+" Valid `mode` values:
+" - "delete"
+" - "force_delete"
+" - "wipe"
+" - "force_wipe"
 function! s:RemoveBuffer(mode)
     " Are we on a line with a file name?
     if line('.') < s:firstBufferLine
@@ -1161,27 +1266,32 @@ function! s:RemoveBuffer(mode)
     endif
 
     let mode = a:mode
+    let forced = mode =~# '^force_'
 
     " These commands are to temporarily suspend the activity of winmanager.
     if exists("b:displayMode") && b:displayMode == "winmanager"
         call WinManagerSuspendAUs()
     end
 
-    let _bufNbr = str2nr(getline('.'))
+    let bufNbr = str2nr(getline('.'))
+    let buf = s:raw_buffer_listing[bufNbr]
 
-    if getbufvar(_bufNbr, '&modified') == 1
+    if !forced && (buf.isterminal || getbufvar(bufNbr, '&modified'))
+        if buf.isterminal
+            let msg = "Buffer " . bufNbr . " is a terminal"
+        else
+            let msg = "No write since last change for buffer " . bufNbr
+        endif
         " Calling confirm() requires Vim built with dialog option.
         if !has("dialog_con") && !has("dialog_gui")
-            call s:Error("Sorry, no write since last change for buffer "._bufNbr.", unable to delete")
+            call s:Error(msg . "; cannot remove without 'force'")
             return
         endif
 
-        let answer = confirm('No write since last change for buffer '._bufNbr.'. Delete anyway?', "&Yes\n&No", 2)
+        let answer = confirm(msg . "; Remove anyway?", "&Yes\n&No", 2)
 
-        if a:mode == "delete" && answer == 1
-            let mode = "force_delete"
-        elseif a:mode == "wipe" && answer == 1
-            let mode = "force_wipe"
+        if answer == 1
+            let mode = 'force_' . mode
         else
             return
         endif
@@ -1189,7 +1299,7 @@ function! s:RemoveBuffer(mode)
     endif
 
     " Okay, everything is good, delete or wipe the buffer.
-    call s:DeleteBuffer(_bufNbr, mode)
+    call s:DeleteBuffer(bufNbr, mode)
 
     " Reactivate winmanager autocommand activity.
     if exists("b:displayMode") && b:displayMode == "winmanager"
@@ -1199,30 +1309,50 @@ function! s:RemoveBuffer(mode)
 endfunction
 
 " DeleteBuffer {{{2
-function! s:DeleteBuffer(buf, mode)
+" Valid `mode` values:
+" - "delete"
+" - "force_delete"
+" - "wipe"
+" - "force_wipe"
+function! s:DeleteBuffer(bufNbr, mode)
     " This routine assumes that the buffer to be removed is on the current line.
+    if a:mode =~# 'delete$' && bufexists(a:bufNbr) && !buflisted(a:bufNbr)
+        call s:Error('Buffer ' . a:bufNbr
+                \ . ' is unlisted; must `wipe` to remove')
+        return
+    endif
     try
         " Wipe/Delete buffer from Vim.
         if a:mode == "wipe"
-            execute "silent bwipe" a:buf
+            execute "silent bwipe" a:bufNbr
         elseif a:mode == "force_wipe"
-            execute "silent bwipe!" a:buf
+            execute "silent bwipe!" a:bufNbr
         elseif a:mode == "force_delete"
-            execute "silent bdelete!" a:buf
+            execute "silent bdelete!" a:bufNbr
         else
-            execute "silent bdelete" a:buf
+            execute "silent bdelete" a:bufNbr
         endif
+    catch
+        call s:Error(v:exception)
+    endtry
 
+    if bufexists(a:bufNbr)
+        " Buffer is still present.  We may have failed to wipe it, or it may
+        " have changed attributes (as `:bd` only makes a buffer unlisted).
+        " Regather information on this buffer, update the buffer list, and
+        " redisplay.
+        let info = s:GetBufferInfo(a:bufNbr)
+        let s:raw_buffer_listing[a:bufNbr] = info[a:bufNbr]
+        call s:RedisplayBufferList()
+    else
         " Delete the buffer from the list on screen.
         setlocal modifiable
         normal! "_dd
         setlocal nomodifiable
 
         " Delete the buffer from the raw buffer list.
-        unlet s:raw_buffer_listing[a:buf]
-    catch
-        call s:Error(v:exception)
-    endtry
+        unlet s:raw_buffer_listing[a:bufNbr]
+    endif
 endfunction
 
 " Close {{{2
@@ -1255,22 +1385,19 @@ endfunction
 " ToggleShowTerminal {{{2
 function! s:ToggleShowTerminal()
     let g:bufExplorerShowTerminal = !g:bufExplorerShowTerminal
-    call s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleSplitOutPathName {{{2
 function! s:ToggleSplitOutPathName()
     let g:bufExplorerSplitOutPathName = !g:bufExplorerSplitOutPathName
-    call s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleShowRelativePath {{{2
 function! s:ToggleShowRelativePath()
     let g:bufExplorerShowRelativePath = !g:bufExplorerShowRelativePath
-    call s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleShowTabBuffer {{{2
@@ -1279,22 +1406,19 @@ function! s:ToggleShowTabBuffer()
     " `g:bufExplorerShowTabBuffer`.
     unlet! s:mruOrder
     let g:bufExplorerShowTabBuffer = !g:bufExplorerShowTabBuffer
-    call s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleOnlyOneTab {{{2
 function! s:ToggleOnlyOneTab()
     let g:bufExplorerOnlyOneTab = !g:bufExplorerOnlyOneTab
-    call s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleShowUnlisted {{{2
 function! s:ToggleShowUnlisted()
     let g:bufExplorerShowUnlisted = !g:bufExplorerShowUnlisted
-    let num_bufs = s:RebuildBufferList()
-    call s:UpdateHelpStatus()
+    call s:RedisplayBufferList()
 endfunction
 
 " ToggleFindActive {{{2
